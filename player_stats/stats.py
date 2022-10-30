@@ -4,15 +4,7 @@ r"""
 import statistics
 from player_stats import scraper
 import numpy as np
-from scipy import stats
 import re
-
-# DEFENSE_PAGE = scraper.get_team_def_stats_table()
-# TOP_PASS_D = scraper.get_top_n_team_stats(DEFENSE_PAGE, 5, "Passing", False)
-# TOP_RUSHING_D = scraper.get_top_n_team_stats(DEFENSE_PAGE, 5, "Rushing", False)
-# WORST_RUSHING_D = scraper.get_top_n_team_stats(DEFENSE_PAGE, 5, "Rushing",
-#  True)
-# WORST_PASS_D = scraper.get_top_n_team_stats(DEFENSE_PAGE, 5, "Rushing", True)
 
 QB_D_STATS = scraper.get_pos_defense_ranking(
     scraper.RANKING_FOR_POS_REGEX.get("qb"))
@@ -32,7 +24,7 @@ WORST_WR_D = scraper.get_top_n_def_for_pos(WR_D_STATS, 5, True)
 TOP_TE_D = scraper.get_top_n_def_for_pos(TE_D_STATS, 5, False)
 WORST_TE_D = scraper.get_top_n_def_for_pos(TE_D_STATS, 5, True)
 
-SCORE_REGEX = re.compile(r"^[WL]{1}(\d+)[\-]{1}(\d+).*?$")
+SCORE_REGEX = re.compile(r"^[WLT]{1}(\d+)[\-]{1}(\d+).*?$")
 
 LAST_Y_STAT_W = 85
 THIS_YEAR_STAT_W = 100
@@ -112,8 +104,6 @@ def get_weighted_mean(stat_key, year_for_gl):
         Calculate weighted averge..
     """
     last_year_yds = this_years_yds = blow_out_game_yds = []
-    print(type(year_for_gl))
-    print(year_for_gl)
     if year_for_gl.get('2021') is not None:
         for game_log in year_for_gl['2021']:
             score_match = SCORE_REGEX.match(game_log['Result'])
@@ -139,7 +129,7 @@ def get_weighted_mean(stat_key, year_for_gl):
             weighted_this_year) / (100 + 70 + 85)
 
 
-def prop_string(prop, projection) -> str():
+def format_proj(projection) -> str():
     r"""
       Create project string for file
     """
@@ -196,7 +186,7 @@ def get_weight_for_def(proj, opp, top_5_d, worst_5_d, pos_weight):
     return 0
 
 
-def calc_rush_att_proj(prop, gamelogs, opp, team, spread, total):
+def calc_rush_att_proj(gamelogs, opp, team, spread, total):
     r"""
       Calculate rush attempt projection
     """
@@ -214,15 +204,14 @@ def calc_rush_att_proj(prop, gamelogs, opp, team, spread, total):
         spread_weight = get_weight_for_spread(team_spread, [-18, 18, 0], proj)
     proj += spread_weight
     proj += def_weight
-    return prop_string(prop, proj)
+    return format_proj(proj)
 
 
-def calc_pass_yds_proj(prop, gamelogs, opp, team, spread, total):
+def calc_pass_yds_proj(gamelogs, opp, team, spread, total):
     """
       Calc pass yds
     """
     pass_stats = get_stats(gamelogs, PASSING_KEY)
-    # print(remove_outliers('YDS', pass_stats))
     proj = get_weighted_mean('YDS', remove_outliers('YDS', pass_stats))
     def_weight = get_weight_for_def(proj, opp, TOP_QB_D, WORST_QB_D,
                                     QB_D_YDS_WEIGHT)
@@ -238,10 +227,10 @@ def calc_pass_yds_proj(prop, gamelogs, opp, team, spread, total):
 
     proj += spread_weight
     proj += def_weight
-    return prop_string(prop, proj)
+    return format_proj(proj)
 
 
-def calc_rush_yds_proj(prop, gamelogs, opp, team, spread, total):
+def calc_rush_yds_proj(gamelogs, opp, team, spread, total):
     """
       calc rush yards
     """
@@ -261,10 +250,10 @@ def calc_rush_yds_proj(prop, gamelogs, opp, team, spread, total):
 
     proj += spread_weight
     proj += def_weight
-    return prop_string(prop, proj)
+    return format_proj(proj)
 
 
-def calc_rec_yds_proj(prop, gamelogs, opp, team, spread, total):
+def calc_rec_yds_proj(gamelogs, opp, team, spread, total):
     """
       Calc rec yards
     """
@@ -284,10 +273,10 @@ def calc_rec_yds_proj(prop, gamelogs, opp, team, spread, total):
 
     proj += def_weight
     proj += spread_weight
-    return prop_string(prop, proj)
+    return format_proj(proj)
 
 
-def calc_pass_att_proj(prop, gamelogs, opp, team, spread, total):
+def calc_pass_att_proj(gamelogs, opp, team, spread, total):
     r"""
       Calculate pass attempt projection
     """
@@ -307,10 +296,10 @@ def calc_pass_att_proj(prop, gamelogs, opp, team, spread, total):
 
     proj += spread_weight
     proj += def_weight
-    return prop_string(prop, proj)
+    return format_proj(proj)
 
 
-def calc_pass_comp_proj(prop, gamelogs, opp, team, spread, total):
+def calc_pass_comp_proj(gamelogs, opp, team, spread, total):
     r"""
       Calculate pass completion projection
     """
@@ -330,10 +319,10 @@ def calc_pass_comp_proj(prop, gamelogs, opp, team, spread, total):
 
     proj += spread_weight
     proj += def_weight
-    return prop_string(prop, proj)
+    return format_proj(proj)
 
 
-def calc_rec_proj(prop, gamelogs, opp, team, spread, total):
+def calc_rec_proj(gamelogs, opp, team, spread, total):
     r"""
       Calculate receptions projection
     """
@@ -353,7 +342,7 @@ def calc_rec_proj(prop, gamelogs, opp, team, spread, total):
 
     proj += spread_weight
     proj += def_weight
-    return prop_string(prop, proj)
+    return format_proj(proj)
 
 
 def get_stats(gamelogs, stat_key):

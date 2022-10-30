@@ -9,72 +9,6 @@ data = [{
     'projection': '225.4'
 }, {
     'game': 'BAL @ TB',
-    'id': 'T. Brady',
-    'prop': 'Pass Yds',
-    'odds': 'o282.5 −115',
-    'projection': '298.0'
-}, {
-    'game': 'BAL @ TB',
-    'id': 'L. Jackson',
-    'prop': 'Pass Completions',
-    'odds': 'o19.5 −110',
-    'projection': '20.2'
-}, {
-    'game': 'BAL @ TB',
-    'id': 'T. Brady',
-    'prop': 'Pass Completions',
-    'odds': 'o25.5 −110',
-    'projection': '28.8'
-}, {
-    'game': 'BAL @ TB',
-    'id': 'L. Jackson',
-    'prop': 'Pass Attempts',
-    'odds': 'o29.5 +100',
-    'projection': '33.2'
-}, {
-    'game': 'BAL @ TB',
-    'id': 'T. Brady',
-    'prop': 'Pass Attempts',
-    'odds': 'o38.5 −130',
-    'projection': '43.0'
-}, {
-    'game': 'BAL @ TB',
-    'id': 'G. Edwards',
-    'prop': 'Rush Yds',
-    'odds': 'o44.5 −115',
-    'projection': '55.7'
-}, {
-    'game': 'BAL @ TB',
-    'id': 'L. Jackson',
-    'prop': 'Rush Yds',
-    'odds': 'o60.5 −115',
-    'projection': '53.8'
-}, {
-    'game': 'BAL @ TB',
-    'id': 'L. Fournette',
-    'prop': 'Rush Yds',
-    'odds': 'o50.5 −115',
-    'projection': '50.6'
-}, {
-    'game': 'BAL @ TB',
-    'id': 'C. Otton',
-    'prop': 'Rec Yds',
-    'odds': 'o29.5 −115',
-    'projection': '24.6'
-}, {
-    'game': 'BAL @ TB',
-    'id': 'C. Godwin',
-    'prop': 'Rec Yds',
-    'odds': 'o73.5 −115',
-    'projection': '71.3'
-}, {
-    'game': 'BAL @ TB',
-    'id': 'L. Fournette',
-    'prop': 'Rec Yds',
-    'odds': 'o29.5 −115',
-    'projection': '33.1'
-}, {
-    'game': 'BAL @ TB',
     'id': 'M. Andrews',
     'prop': 'Rec Yds',
     'odds': 'o58.5 −115',
@@ -133,4 +67,4 @@ data = [{
 class TestGrapg:
 
     def test_graph_builder(self):
-        main.build_graphic(data, 21, 5)
+        pass
