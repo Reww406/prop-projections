@@ -9,6 +9,10 @@ from typing import OrderedDict
 from requests import HTTPError, ConnectTimeout, ReadTimeout
 from more_itertools import take
 import requests
+from requests_futures.sessions import FuturesSession
+from concurrent.futures import ThreadPoolExecutor
+from requests.adapters import HTTPAdapter, Retry
+
 from seleniumwire import webdriver
 from bs4 import BeautifulSoup, SoupStrainer
 from selenium.webdriver.common.by import By
@@ -170,6 +174,12 @@ PREFS = {
     }
 }
 
+retries = Retry(total=5,
+                backoff_factor=0.1,
+                status_forcelist=[500, 502, 503, 504])
+
+session = FuturesSession(executor=ThreadPoolExecutor(max_workers=12))
+session.mount("http://", HTTPAdapter(max_retries=retries))
 CHROM_DRIVER_PATH = "/usr/bin/chromedriver"
 CHROME_OPTIONS.add_experimental_option("prefs", PREFS)
 OPTIONS = {'proxy': {'http': PROXY_URL, 'https': PROXY_URL}}
@@ -208,12 +218,31 @@ def scrape(url):
     raise Exception("Failed to get: " + url)
 
 
+def scrape_async(url):
+    """
+        Returns a future of resp instead of the response..
+    """
+    for _ in range(1):
+        try:
+            headers = {"User-Agent": USER_AGENTS[random.randint(0, 2)]}
+
+            future = session.get(url,
+                                 headers=headers,
+                                 timeout=20,
+                                 proxies=PROXIES)
+            time.sleep(0.3)
+            return future
+        except (requests.exceptions.SSLError, requests.exceptions.ProxyError,
+                ConnectionError, HTTPError, ConnectTimeout, ReadTimeout):
+            print("Failed to get request.. retrying")
+    raise Exception("Failed to get: " + url)
+
+
 def scrape_prop_page(url):
     r"""
         Get page text using Selenium
         Waits for object on prop page before returing
     """
-    print("Getting: " + url)
     for _ in range(3):
         try:
             DRIVER.get(url)
@@ -233,7 +262,6 @@ def scrape_js_page(url):
     """
     for _ in range(3):
         try:
-            print("Getting: " + url)
             DRIVER.get(url)
             return DRIVER.page_source
         except Exception as err:
@@ -264,6 +292,7 @@ def get_player_gamelog_links(team_page, player_names):
             # Get N. Harris
             name = (match.group(1).strip()[0:1].upper() + ". " +
                     match.group(2).strip().capitalize())
+
             if name not in player_names:
                 # Should skip players we didn't ask for
                 continue
@@ -322,8 +351,12 @@ def convert_player_name_to_espn(line):
         T. Name
     """
     name_split = line.split(",")[0].strip()
-    return name_split[0:1].upper() + ". " + name_split.split()[1].capitalize(
+    name = name_split[0:1].upper() + ". " + name_split.split()[1].capitalize(
     ).strip()
+    if len(name_split.split()) > 2:
+        name += "-"
+        name += name_split.split()[2].lower()
+    return name
 
 
 def is_regular_season_header(table):
@@ -349,7 +382,7 @@ def filter_player_by_depth(team_initial, player_names):
     # Replaces stats wtih depth.
     depth_link = re.sub("stats", "depth",
                         INT_TEAM_URL.get(team_initial.upper(), 1))
-    soup = BeautifulSoup(scrape(depth_link), "html.parser")
+    soup = BeautifulSoup(scrape(depth_link).text, "html.parser")
     pos_table = soup.find(
         "table", {"class": ["Table", "Table--fixed", "Table--fixed-left"]})
     pos_rows = list(
@@ -375,24 +408,44 @@ def filter_player_by_depth(team_initial, player_names):
     return filtered_names
 
 
-def get_player_gamelogs(team_initial, player_name):
+def get_player_gamelogs(player_for_team):
     """
+        :param player_for_team = {'CIN': 'J. Mixon'}
         Gets gamelog stats for a single player and team
     """
-    team_url = INT_TEAM_URL.get(team_initial.upper())
-    # has names
-    link = get_player_gamelog_links(scrape(team_url), [player_name])
-    player_stats = {}
-    print(f"Processing player: {player_name}")
-    gamelogs = {}
-    curr_year_link = link.get(player_name)
-    last_years_link = ESPN_GL_YEAR_REGEX.match(curr_year_link).group(
-        1) + GAMELOG_YEAR_URI
+    gl_futures_for_player = {}
+    for team_initial, player_name in player_for_team.items():
+        team_url = INT_TEAM_URL.get(team_initial.upper())
+        # has names
+        link = get_player_gamelog_links(scrape(team_url), [player_name])
+        player_stats = {}
+        print(f"Processing player: {player_name}")
+        curr_year_link = link.get(player_name)
+        last_years_link = ESPN_GL_YEAR_REGEX.match(curr_year_link).group(
+            1) + GAMELOG_YEAR_URI
+        gl_futures_for_player[player_name] = [
+            scrape_async(curr_year_link),
+            scrape_async(last_years_link)
+        ]
 
-    add_gamelog(curr_year_link, CURRENT_YEAR, gamelogs, player_name)
-    add_gamelog(last_years_link, LAST_YEAR, gamelogs, player_name)
-    player_stats[player_name] = gamelogs
+    for player_name, gl_futures in gl_futures_for_player.items():
+        gamelogs = []
+        add_gamelog(gl_futures[0], gamelogs, player_name)
+        add_gamelog(gl_futures[1], gamelogs, player_name)
+        player_stats[player_name] = gamelogs
     return player_stats
+
+
+def add_gamelog(gl_future, gamelogs, player_name):
+    """
+        Gets gamelog for 'year' and adds it to 'gamelogs'
+        Used in: get_player_gamelog_per_team
+    """
+    gamelog = parse_player_gamelog(gl_future.result())
+    if gamelog is not None:
+        gamelogs.extend(gamelog)
+    else:
+        print(f"Can't get {player_name}")
 
 
 def get_players_gamelogs(team_initial, player_names):
@@ -409,29 +462,24 @@ def get_players_gamelogs(team_initial, player_names):
     links = get_player_gamelog_links(scrape(team_url), player_names)
     player_stats = {}
     print(f"Processing team: {team_initial}")
+    gl_futures_for_player = {}
     for player_name in links:
-        gamelogs = {}
         curr_year_link = links.get(player_name)
         last_years_link = ESPN_GL_YEAR_REGEX.match(curr_year_link).group(
             1) + GAMELOG_YEAR_URI
 
-        add_gamelog(curr_year_link, CURRENT_YEAR, gamelogs, player_name)
-        add_gamelog(last_years_link, LAST_YEAR, gamelogs, player_name)
-        print(f"Got player: {player_name}")
+        gl_futures_for_player[player_name] = [
+            scrape_async(curr_year_link),
+            scrape_async(last_years_link)
+        ]
+
+    for player_name, gl_futures in gl_futures_for_player.items():
+        gamelogs = []
+        add_gamelog(gl_futures[0], gamelogs, player_name)
+        add_gamelog(gl_futures[1], gamelogs, player_name)
         player_stats[player_name] = gamelogs
+        print(f"Got player: {player_name}")
     return player_stats
-
-
-def add_gamelog(link, year, gamelogs, player_name):
-    """
-        Gets gamelog for 'year' and adds it to 'gamelogs'
-        Used in: get_player_gamelog_per_team
-    """
-    gamelog = parse_player_gamelog(scrape(link))
-    if gamelog is not None:
-        gamelogs[year] = gamelog
-    else:
-        print(f"Can't get {player_name} stats from {year}")
 
 
 def parse_player_gamelog(http_resp):

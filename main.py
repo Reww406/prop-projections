@@ -8,6 +8,7 @@ import time
 import pandas as pd
 from matplotlib import pyplot as plt
 import matplotlib.backends.backend_pdf
+import numpy as np
 
 from player_stats import scraper
 from player_stats import stats
@@ -33,6 +34,7 @@ CURR_SEASON = '2022 Regular Season'
 OPP_REGEX = re.compile(r"^(@|vs)(\w+)$")
 
 START_TIME = str(int(time.time()))
+result_per = []
 
 
 # get unique players
@@ -160,7 +162,7 @@ def create_results(game_dict, game_logs, current_game, spread, total, date):
     """
     teams = current_game.split('@')
     results_file = open('./results/results-' + teams[0].strip() + "-" +
-                        teams[1].strip() + "-v4.txt",
+                        teams[1].strip() + "-v2.txt",
                         'w',
                         encoding='UTF-8')
     results_file.write("Game: " + str(current_game) + "\n")
@@ -199,8 +201,10 @@ def create_results(game_dict, game_logs, current_game, spread, total, date):
         results_file.write(player_name + ", " + teams[0] + ", " + str(prop) +
                            ", " + str(odds) + ", P:" + str(proj) + ", A:" +
                            str(actual_stat) + ", " + str(hit) + '\n')
-    percentage = (float(correct / total)) * 100
-    results_file.write("\n\n Correct: " + str(percentage) + "%")
+    if total > 0:
+        percentage = (float(correct / total)) * 100
+        result_per.append(percentage)
+        results_file.write("\n\n Correct: " + str(percentage) + "%")
     results_file.close()
 
 
@@ -212,11 +216,11 @@ def get_most_recent_game(player_name, game_logs, game_date):
         games = game_logs.get(team_name)
         player_games = games.get(player_name)
         if player_games is not None:
-            this_year_games = player_games.get(CURR_YEAR)
-            for game in this_year_games:
-                this_games_date = game.get(CURR_SEASON).get('Date').lower()
-                if this_games_date == game_date.lower():
-                    return game
+            for game in player_games:
+                if game.get(CURR_SEASON) is not None:
+                    this_games_date = game.get(CURR_SEASON).get('Date').lower()
+                    if this_games_date == game_date.lower():
+                        return game
 
     return None
 
@@ -307,9 +311,7 @@ def process_prop(lines, gamelogs, table, game, spread, total):
         opp.remove(team)
         opp = opp[0]
         if gamelogs is not None:
-            print(
-                f"Calculateing proj for: {player_name} prop: {table.get('prop')}"
-            )
+            print(f"Calculating proj for: {player_name}")
             if prop in FUNC_FOR_PROP:
                 if gamelogs[team].get(player_name) is None:
                     print(f"{player_name} is not a start.")
@@ -365,16 +367,23 @@ def write_props(props, file):
 # When getting players links get there depth chart pos and actual pos
 # fix names with - and st.
 try:
-    PROP_FILE_TS = "./props/" + START_TIME + "-props.txt"
-    prop_file = open(PROP_FILE_TS, 'w', encoding='UTF-8')
-    create_prop_file(prop_file, 1, "Mon 11-7")
+    # PROP_FILE_TS = "./props/" + START_TIME + "-props.txt"
+    # prop_file = open(PROP_FILE_TS, 'w', encoding='UTF-8')
+    # create_prop_file(prop_file, 1, "Mon 11-7")
+    # prop_file.close()
+
+    prop_file = open("./props/second-week.txt", 'r', encoding='UTF-8')
+    create_report(prop_file, create_results)
+    # create_report(prop_file, None)
+
     prop_file.close()
 
-    prop_file = open(PROP_FILE_TS, 'r', encoding='UTF-8')
-    # create_report(prop_file, create_results)
-    create_report(prop_file, None)
+    prop_file = open("./props/first-week.txt", 'r', encoding='UTF-8')
+    create_report(prop_file, create_results)
+    # create_report(prop_file, None)
 
     prop_file.close()
+    print(f"Total result: {np.array(result_per).mean()}")
 finally:
     scraper.driver_quit()
     prop_file.close()
