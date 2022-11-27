@@ -12,6 +12,8 @@ import requests
 from requests_futures.sessions import FuturesSession
 from concurrent.futures import ThreadPoolExecutor
 from requests.adapters import HTTPAdapter, Retry
+from player_stats import constants as const
+from player_stats import sqllite_utils
 
 from seleniumwire import webdriver
 from bs4 import BeautifulSoup, SoupStrainer
@@ -63,11 +65,10 @@ def create_draft_edge_to_int(team_urls):
     return team_name_to_int
 
 
-QUES_REGEX = re.compile(r"^(.*?)(\sQ)?$")
+QUES_REGEX = re.compile(r"^(.*?)(\s(Q|O|IR))?$")
 NAME_LINK_REGEX = re.compile(r"^.*?/name/(\w+)/(.*?)$", re.IGNORECASE)
 REGULAR_SESSION_REGEX = re.compile(r"^\d{4}\sRegular.*?$")
-PLAYER_LINK_REGEX = re.compile(
-    r"^.*/player/.*?\d+/([a-zA-Z]+)-([a-zA-Z]+[-]?[a-zA-Z]*).*?$")
+PLAYER_LINK_REGEX = re.compile(r"^.*/player/.*?\d+/(.*?)$")
 SPREAD_REGEX = re.compile(r"^([\-\+]{1}[\d]+\.?[5]?).*?$")
 DK_NAME_REGEX = re.compile(r"^(.*?)[(]\w+[)]$")
 TOTAL_REGEX = re.compile(r".*?\s([\d]+.*?)")
@@ -79,10 +80,8 @@ RANKING_FOR_POS_REGEX = {
 }
 ESPN_GL_YEAR_REGEX = re.compile(r"^(.*?/id/[\d]+/).*?$")
 
-LAST_YEAR = '2021'
-CURRENT_YEAR = '2022'
 # Only matters for non current years
-GAMELOG_YEAR_URI = "type/nfl/year/" + LAST_YEAR
+GAMELOG_YEAR_URI = "type/nfl/year/" + const.LAST_YEAR
 
 # https://www.espn.com/nfl/team/stats/_/name/mia/miami-dolphins
 # https://www.espn.com/nfl/team/depth/_/name/mia/miami-dolphins
@@ -127,10 +126,11 @@ INT_TEAM_URL = add_team_initials([
 
 DRAFT_EDGE_TO_INT = create_draft_edge_to_int(INT_TEAM_URL)
 
-PROPS_TO_PARSE = [
-    "Pass Yds", "Pass Completions", "Pass Attempts", "Rush Yds", "Rec Yds",
-    "Receptions", "Rush Attempts"
-]
+# PROPS_TO_PARSE = [
+#     "Pass Yds", "Pass Completions", "Pass Attempts", "Rush Yds", "Rec Yds",
+#     "Rush Attempts"
+# ]
+PROPS_TO_PARSE = ["Rush Yds", "Rec Yds"]
 
 DK_TO_ESPN_NAME_CONV = {
     "NY Jets": "NYJ",
@@ -194,11 +194,13 @@ DRIVER = webdriver.Chrome(CHROM_DRIVER_PATH,
 DRIVER.set_page_load_timeout(35)
 MAX_RETRIES = 3
 
+LINE_POS_NAMES = ['LT', 'LG', 'C', 'RG', 'RT']
+
 
 #
 # HTTP Functions
 #
-def scrape(url):
+def _scrape(url):
     r"""
         Rotates IP and user agent for request
     """
@@ -218,7 +220,7 @@ def scrape(url):
     raise Exception("Failed to get: " + url)
 
 
-def scrape_async(url):
+def _scrape_async(url):
     """
         Returns a future of resp instead of the response..
     """
@@ -238,7 +240,7 @@ def scrape_async(url):
     raise Exception("Failed to get: " + url)
 
 
-def scrape_prop_page(url):
+def _scrape_prop_page(url):
     r"""
         Get page text using Selenium
         Waits for object on prop page before returing
@@ -256,7 +258,7 @@ def scrape_prop_page(url):
     raise Exception("Failed to get: " + url)
 
 
-def scrape_js_page(url):
+def _scrape_js_page(url):
     r"""
         Get page text using Selenium
     """
@@ -273,7 +275,17 @@ def scrape_js_page(url):
 # ESPN Scraping
 #
 # Get links for players in player_names
-def get_player_gamelog_links(team_page, player_names):
+def add_gamelogs_to_db(team_initial, player_names, db):
+    """
+        Gets Players Game logs from either the SQLite Database or the ESPN
+        if it gets them from espn it calls a function to store them in the sql
+        database
+    """
+    player_gls = _scrape_gls_from_espn(team_initial, player_names)
+    _add_gamelogs_to_db(player_gls, team_initial, db)
+
+
+def _get_player_gamelog_links(team_page, player_names):
     r"""
     Gets ESPN links for players passed in player_names
     :param player_names list of players that should be grabbed from ESPN
@@ -290,8 +302,7 @@ def get_player_gamelog_links(team_page, player_names):
         match = PLAYER_LINK_REGEX.match(link["href"])
         if match is not None:
             # Get N. Harris
-            name = (match.group(1).strip()[0:1].upper() + ". " +
-                    match.group(2).strip().capitalize())
+            name = (match.group(1).strip())
 
             if name not in player_names:
                 # Should skip players we didn't ask for
@@ -303,7 +314,7 @@ def get_player_gamelog_links(team_page, player_names):
     return name_link
 
 
-def parse_gamelog_tbody(tbody):
+def _parse_gamelog_tbody(tbody):
     r"""
     :param tbody is beatiful soup object of table body
     Each sub-list (row) in the list is a game log
@@ -321,7 +332,7 @@ def parse_gamelog_tbody(tbody):
     return stats
 
 
-def parse_table_head(thead):
+def _parse_table_head(thead):
     r"""
     Creates a ordered dictionary with \{section : \[headers\]\}
     Uses colspan html attribute to decide how many headers to put in
@@ -350,16 +361,14 @@ def convert_player_name_to_espn(line):
         Convert DK name to ESPN
         T. Name
     """
-    name_split = line.split(",")[0].strip()
-    name = name_split[0:1].upper() + ". " + name_split.split()[1].capitalize(
-    ).strip()
-    if len(name_split.split()) > 2:
-        name += "-"
-        name += name_split.split()[2].lower()
-    return name
+    name = line.split(",")[0].strip()
+    name = re.sub(r"\s", "-", name)
+    name = re.sub(r"[.]", "", name)
+    name = re.sub(r"[']", "", name)
+    return name.lower()
 
 
-def is_regular_season_header(table):
+def _is_regular_season_header(table):
     r"""
         Checks if ESPN table header has correct attributes vs
         the post season table.
@@ -373,93 +382,138 @@ def is_regular_season_header(table):
     return False
 
 
-def filter_player_by_depth(team_initial, player_names):
+def _filter_player_by_depth(teams):
     """
         :returns list of filtered player_names with only starters
         Gets depth chart url using team_initial
     """
-    filtered_names = []
-    # Replaces stats wtih depth.
-    depth_link = re.sub("stats", "depth",
-                        INT_TEAM_URL.get(team_initial.upper(), 1))
-    soup = BeautifulSoup(scrape(depth_link).text, "html.parser")
-    pos_table = soup.find(
-        "table", {"class": ["Table", "Table--fixed", "Table--fixed-left"]})
-    pos_rows = list(
-        filter(None, [
-            x.text.strip() for x in pos_table.find_all(
-                "tr", {"class": ["Table__TR", "Table__TR--sm", "Table__even"]})
-        ]))
-    player_table = soup.find_all("tbody", {"class": ["Table__TBODY"]})[1]
-    for (pos, row) in zip(pos_rows, player_table.find_all('tr')):
-        amount = 1
-        if pos == 'QB':
-            # Will only have prop for whoever is starting
-            amount = 2
-        count = 1
-        for table_data in row.find_all('td'):
-            if count > amount:
-                break
-            match = QUES_REGEX.match(table_data.text.strip())
-            espn_name = convert_player_name_to_espn(match.group(1))
-            if espn_name in player_names:
-                filtered_names.append(espn_name)
-            count += 1
-    return filtered_names
+    players = []
+    for team in teams:
+        # Replaces stats wtih depth.
+        depth_link = re.sub("stats", "depth",
+                            INT_TEAM_URL.get(team.upper(), 1))
+        soup = BeautifulSoup(_scrape(depth_link).text, "html.parser")
+        pos_table = soup.find(
+            "table", {"class": ["Table", "Table--fixed", "Table--fixed-left"]})
+        pos_rows = list(
+            filter(None, [
+                x.text.strip() for x in pos_table.find_all(
+                    "tr",
+                    {"class": ["Table__TR", "Table__TR--sm", "Table__even"]})
+            ]))
+        player_table = soup.find_all("tbody", {"class": ["Table__TBODY"]})[1]
+        for (pos, row) in zip(pos_rows, player_table.find_all('tr')):
+            amount = 1
+            if pos == 'QB':
+                # Will only have prop for whoever is starting
+                amount = 2
+            count = 1
+            if pos == 'FB':
+                print("skipping FB")
+                continue
+            for table_data in row.find_all('td'):
+                if count > amount:
+                    break
+                match = QUES_REGEX.match(table_data.text.strip())
+                espn_name = convert_player_name_to_espn(match.group(1))
+                players.append(espn_name)
+                count += 1
+    return players
 
 
-def get_player_gamelogs(player_for_team):
+def get_hurt_players(teams):
     """
-        :param player_for_team = {'CIN': 'J. Mixon'}
-        Gets gamelog stats for a single player and team
+        :returns list of filtered player_names with only starters
+        Gets depth chart url using team_initial
+        
+        Returns hurt starting rec + remaining
+        Returns hurt Linemen
+        r
     """
-    gl_futures_for_player = {}
-    for team_initial, player_name in player_for_team.items():
-        team_url = INT_TEAM_URL.get(team_initial.upper())
-        # has names
-        link = get_player_gamelog_links(scrape(team_url), [player_name])
-        player_stats = {}
-        print(f"Processing player: {player_name}")
-        curr_year_link = link.get(player_name)
-        last_years_link = ESPN_GL_YEAR_REGEX.match(curr_year_link).group(
-            1) + GAMELOG_YEAR_URI
-        gl_futures_for_player[player_name] = [
-            scrape_async(curr_year_link),
-            scrape_async(last_years_link)
-        ]
+    flags = []
+    for team in teams:
+        team = team.strip()
+        # Replaces stats wtih depth.
+        depth_link = re.sub("stats", "depth",
+                            INT_TEAM_URL.get(team.upper(), 1))
+        soup = BeautifulSoup(_scrape(depth_link).text, "html.parser")
+        pos_table = soup.find(
+            "table", {"class": ["Table", "Table--fixed", "Table--fixed-left"]})
+        pos_rows = list(
+            filter(None, [
+                x.text.strip() for x in pos_table.find_all(
+                    "tr",
+                    {"class": ["Table__TR", "Table__TR--sm", "Table__even"]})
+            ]))
+        player_table = soup.find_all("tbody", {"class": ["Table__TBODY"]})[1]
+        for (pos, row) in zip(pos_rows, player_table.find_all('tr')):
+            amount = 1
+            count = 1
+            if pos in LINE_POS_NAMES:
+                for table_data in row.find_all('td'):
+                    if count > amount:
+                        break
+                    match = QUES_REGEX.match(table_data.text.strip())
+                    out = match.groups()[2]
+                    if out is not None and out.strip() == 'O':
+                        print("Found line men..")
+                        flags.append(f'{team} starting {pos} out')
+                    count += 1
+            elif pos == 'WR':
+                for table_data in row.find_all('td'):
+                    if count > amount:
+                        break
+                    match = QUES_REGEX.match(table_data.text.strip())
+                    out = match.groups()[2]
+                    if out is not None and out.strip() == 'O':
+                        print("Found WR..")
+                        flags.append(f'{team} starting {pos} out')
+                    count += 1
+            elif pos == 'QB':
+                for table_data in row.find_all('td'):
+                    if count > amount:
+                        break
+                    match = QUES_REGEX.match(table_data.text.strip())
+                    out = match.groups()[2]
+                    if out is not None and out.strip() == 'O':
+                        print("Found QB..")
+                        flags.append(f'{team} starting {pos} out')
+                    count += 1
+    return flags
 
-    for player_name, gl_futures in gl_futures_for_player.items():
-        gamelogs = []
-        add_gamelog(gl_futures[0], gamelogs, player_name)
-        add_gamelog(gl_futures[1], gamelogs, player_name)
-        player_stats[player_name] = gamelogs
-    return player_stats
 
-
-def add_gamelog(gl_future, gamelogs, player_name):
+def _add_gamelogs(gl_future, gamelogs, player_name):
     """
         Gets gamelog for 'year' and adds it to 'gamelogs'
         Used in: get_player_gamelog_per_team
     """
-    gamelog = parse_player_gamelog(gl_future.result())
+    gamelog = _parse_player_gamelog(gl_future.result())
     if gamelog is not None:
         gamelogs.extend(gamelog)
     else:
         print(f"Can't get {player_name}")
 
 
-def get_players_gamelogs(team_initial, player_names):
+def _add_gamelogs_to_db(player_gls, team_intial, db):
+    """
+        Adds gamelogs to SQLite Database
+    """
+    for player, gl_list in player_gls.items():
+        sqllite_utils.insert_game_logs(gl_list, player, team_intial, db)
+
+
+def _scrape_gls_from_espn(team_initial, player_names):
     r"""
         Iterates over player_names to get Urls for game logs..
-        Gets gamelog for players from ESPN, return {player_name: stats}
+    -+6    Gets gamelog for players from ESPN, return {player_name: stats}
     """
     team_url = INT_TEAM_URL.get(team_initial.upper())
     # Filter players down to starts
-    player_names = filter_player_by_depth(team_initial.upper(), player_names)
+    # player_names = _filter_player_by_depth(team_initial.upper(), player_names)
     if team_initial == 'TNF':
         return None
     # has names
-    links = get_player_gamelog_links(scrape(team_url), player_names)
+    links = _get_player_gamelog_links(_scrape(team_url), player_names)
     player_stats = {}
     print(f"Processing team: {team_initial}")
     gl_futures_for_player = {}
@@ -469,20 +523,20 @@ def get_players_gamelogs(team_initial, player_names):
             1) + GAMELOG_YEAR_URI
 
         gl_futures_for_player[player_name] = [
-            scrape_async(curr_year_link),
-            scrape_async(last_years_link)
+            _scrape_async(curr_year_link),
+            _scrape_async(last_years_link)
         ]
 
     for player_name, gl_futures in gl_futures_for_player.items():
         gamelogs = []
-        add_gamelog(gl_futures[0], gamelogs, player_name)
-        add_gamelog(gl_futures[1], gamelogs, player_name)
+        _add_gamelogs(gl_futures[0], gamelogs, player_name)
+        _add_gamelogs(gl_futures[1], gamelogs, player_name)
         player_stats[player_name] = gamelogs
         print(f"Got player: {player_name}")
     return player_stats
 
 
-def parse_player_gamelog(http_resp):
+def _parse_player_gamelog(http_resp):
     r"""
         :param http_resp is a requests response from the ESPN page
         Parse stats from gamelog html
@@ -492,16 +546,16 @@ def parse_player_gamelog(http_resp):
 
     section_stats_header = None
     for thead in soup.find_all(lambda tag: tag.name == "thead"):
-        if is_regular_season_header(thead):
-            section_stats_header = parse_table_head(thead)
+        if _is_regular_season_header(thead):
+            section_stats_header = _parse_table_head(thead)
     if section_stats_header is None:
         return None
 
     all_tables = soup.find_all(lambda tag: tag.name == "tbody")
     if len(all_tables) > 2:
-        stats = parse_gamelog_tbody(all_tables[1])
+        stats = _parse_gamelog_tbody(all_tables[1])
     else:
-        stats = parse_gamelog_tbody(all_tables[0])
+        stats = _parse_gamelog_tbody(all_tables[0])
     # Combine stats and header using the colspan html attribute.
     complete_gamelog = []
     for row_index in range(0, len(stats) - 1):
@@ -520,90 +574,6 @@ def parse_player_gamelog(http_resp):
 #
 # DK Functions
 #
-def is_prop_link(link):
-    """
-        :param soup <a> tag this function checks html classes
-        Makes sure link from draft kings has the correct attributes
-    """
-    if link.get('class') is None or len(link.get('class')) == 0:
-        return False
-    if link['class'][0].lower() == 'sportsbook-tabbed-subheader__tab-link':
-        return True
-    return False
-
-
-def dk_team_to_int(team_name):
-    """
-        :param full name of player -> middle initial last name
-        Takes DK team name and converts to match ESPN
-    """
-    if team_name in DK_TO_ESPN_NAME_CONV:
-        return DK_TO_ESPN_NAME_CONV.get(team_name)
-    return team_name.split()[0].strip()
-
-
-def parse_team_name(prop_page):
-    """
-        :prop_page html from a selenium get
-        Parses DK team name out of page title and converts to match ESPN
-        the team name is not on live pages..
-    """
-    soup = BeautifulSoup(prop_page, "html.parser")
-    teams = re.sub("AT", "@", [
-        div.text for div in soup.find_all(
-            "div", {"class": {"event-page-countdown-timer__title"}})
-    ][0], 1).split("@")
-    return dk_team_to_int(teams[0]) + " @ " + dk_team_to_int(teams[1])
-
-
-def parse_dk_game_page(game_page):
-    """
-        :param game_page is the soup of DK's page for an NFL game
-        Takes DK game page source, and returns {CHI @ WSH: [passing source, rec/rushing source]}
-    """
-    pages = []
-    for game_link in game_page.findAll('a', href=True):
-        if is_prop_link(game_link):
-            if game_link['href'].find(PASSING_PROP_URI) != -1 or game_link[
-                    'href'].find(RUSH_AND_REC_PROP_URI) != -1:
-                source = scrape_prop_page(DK_BASE_PAGE_URL + game_link['href'])
-                pages.append(source)
-    return {parse_team_name(pages[0]): pages}
-
-
-def parse_game_spread(game_page):
-    """
-        :param game_page is soup of an DK NFL game page
-        Takes DK game page source, and return {Spread: {CHI: "+4", "WSH -4}}
-    """
-
-    spread_table = game_page.find("tbody",
-                                  {"class": ["sportsbook-table__body"]})
-    spread_dict = {}
-    for t_row in spread_table.findAll('tr'):
-        team_name = dk_team_to_int(
-            t_row.find("th", {
-                "class": ["sportsbook-table__column-row"]
-            }).text)
-        tds = t_row.findAll("td", {"class": ["sportsbook-table__column-row"]})
-        spread = SPREAD_REGEX.match(tds[0].text).group(1)
-        spread_dict[team_name] = spread
-    return {"Spread": spread_dict}
-
-
-def parse_game_total(game_page):
-    """
-        :param game_page is soup of an NFL DK game page
-        Returns {"Total": total}
-    """
-    total_table = game_page.find("tbody",
-                                 {"class": ["sportsbook-table__body"]})
-    t_row = total_table.find('tr')
-    tds = t_row.findAll("td", {"class": ["sportsbook-table__column-row"]})
-    total = TOTAL_REGEX.match(tds[1].text).group(1)
-    return {"Total": total}
-
-
 def get_game_info_from_dk(table_num):
     r"""
         Takes, table_num as in which section to grab from main NFL page
@@ -614,7 +584,7 @@ def get_game_info_from_dk(table_num):
     """
     start_time = int(time.time())
     scraped_pages = []
-    soup = BeautifulSoup(scrape_js_page(DK_NFL_PAGE_URL), "html.parser")
+    soup = BeautifulSoup(_scrape_js_page(DK_NFL_PAGE_URL), "html.parser")
     table_links = soup.find_all(
         lambda tag: tag.name == "table")[table_num].findAll('a', href=True)
     total_pages = []
@@ -625,50 +595,16 @@ def get_game_info_from_dk(table_num):
         if next_link in scraped_pages:
             continue
         scraped_pages.append(next_link)
-        soup = BeautifulSoup(scrape_js_page(next_link), "html.parser")
+        soup = BeautifulSoup(_scrape_js_page(next_link), "html.parser")
         total_pages.append([
-            parse_dk_game_page(soup),
-            parse_game_spread(soup),
-            parse_game_total(soup)
+            _parse_dk_game_page(soup),
+            _parse_game_spread(soup),
+            _parse_game_total(soup)
         ])
     print(
         f"Took: {str(int(time.time()) - start_time)} seconds to retrieve DK pages"
     )
     return total_pages
-
-
-def fix_odds(text):
-    """
-        :param text is text from DK odds section
-        Turns odds into o32, +200
-    """
-    seperator = ""
-    if text.find('+') != -1:
-        seperator = "+"
-    else:
-        seperator = "−"
-    text = re.sub(r'O\s', 'o', text)
-    text = re.sub(r'U\s', 'u', text)
-    sections = text.split(seperator)
-    return sections[0] + " " + seperator + sections[1]
-
-
-def find_players_team(team_pages, player_name):
-    """
-        :param team_pages {'url': page source from requests}
-        Takes a player name with two possible teams
-        and finds which one he is on
-    """
-    for url in team_pages:
-        for link in BeautifulSoup(team_pages.get(url),
-                                  "html.parser",
-                                  parse_only=SoupStrainer("a")):
-            if len(link.text) <= 0:
-                continue
-            if link.text.lower().find(player_name.lower()) != -1:
-                team_initial = NAME_LINK_REGEX.match(url)
-                return team_initial.group(1).upper()
-    return "TNF"
 
 
 def parse_dk_prop_pages(dk_prop_dict):
@@ -679,8 +615,9 @@ def parse_dk_prop_pages(dk_prop_dict):
     game = next(iter(dk_prop_dict))
     team_pages = {}
     teams = [x.strip() for x in game.split('@')]
+    starters = _filter_player_by_depth(teams)
     for url in [INT_TEAM_URL[x] for x in teams]:
-        team_pages[url] = scrape(url).text
+        team_pages[url] = _scrape(url).text
     props = []
     for text in dk_prop_dict.get(game):
         accordian_divs = BeautifulSoup(text, "html.parser").find_all(
@@ -701,22 +638,170 @@ def parse_dk_prop_pages(dk_prop_dict):
                     player_name = row.find('th').text.strip()
                 data = [
                     player_name,
-                    find_players_team(team_pages, player_name), title.text
+                    _find_players_team(team_pages, player_name), title.text
                 ]
+                odds = []
                 for t_data in row.findAll('td'):
-                    if t_data.text.find("O") != -1:
-                        data.append(fix_odds(t_data.text))
-                props.append(data)
+                    odds.append(t_data.text)
+                data.append(_calculate_be_and_hold(odds))
+                espn_name = convert_player_name_to_espn(player_name)
+                if espn_name in starters:
+                    # print(f"Player is a starter {player_name}")
+                    props.append(data)
+                else:
+                    print(f"{player_name}Player is not a starter..")
     return props
 
 
+def _is_prop_link(link):
+    """
+        :param soup <a> tag this function checks html classes
+        Makes sure link from draft kings has the correct attributes
+    """
+    if link.get('class') is None or len(link.get('class')) == 0:
+        return False
+    if link['class'][0].lower() == 'sportsbook-tabbed-subheader__tab-link':
+        return True
+    return False
+
+
+def _dk_team_to_int(team_name):
+    """
+        :param full name of player -> middle initial last name
+        Takes DK team name and converts to match ESPN
+    """
+    if team_name in DK_TO_ESPN_NAME_CONV:
+        return DK_TO_ESPN_NAME_CONV.get(team_name)
+    return team_name.split()[0].strip()
+
+
+def _parse_team_name(prop_page):
+    """
+        :prop_page html from a selenium get
+        Parses DK team name out of page title and converts to match ESPN
+        the team name is not on live pages..
+    """
+    soup = BeautifulSoup(prop_page, "html.parser")
+    teams = re.sub("AT", "@", [
+        div.text for div in soup.find_all(
+            "div", {"class": {"event-page-countdown-timer__title"}})
+    ][0], 1).split("@")
+    return _dk_team_to_int(teams[0]) + " @ " + _dk_team_to_int(teams[1])
+
+
+def _parse_dk_game_page(game_page):
+    """
+        :param game_page is the soup of DK's page for an NFL game
+        Takes DK game page source, and returns {CHI @ WSH: [passing source, rec/rushing source]}
+    """
+    pages = []
+    for game_link in game_page.findAll('a', href=True):
+        if _is_prop_link(game_link):
+            if game_link['href'].find(PASSING_PROP_URI) != -1 or game_link[
+                    'href'].find(RUSH_AND_REC_PROP_URI) != -1:
+                source = _scrape_prop_page(DK_BASE_PAGE_URL +
+                                           game_link['href'])
+                pages.append(source)
+    return {_parse_team_name(pages[0]): pages}
+
+
+def _parse_game_spread(game_page):
+    """
+        :param game_page is soup of an DK NFL game page
+        Takes DK game page source, and return {Spread: {CHI: "+4", "WSH -4}}
+    """
+
+    spread_table = game_page.find("tbody",
+                                  {"class": ["sportsbook-table__body"]})
+    spread_dict = {}
+    for t_row in spread_table.findAll('tr'):
+        team_name = _dk_team_to_int(
+            t_row.find("th", {
+                "class": ["sportsbook-table__column-row"]
+            }).text)
+        tds = t_row.findAll("td", {"class": ["sportsbook-table__column-row"]})
+        spread = SPREAD_REGEX.match(tds[0].text).group(1)
+        spread_dict[team_name] = spread
+    return {"Spread": spread_dict}
+
+
+def _parse_game_total(game_page):
+    """
+        :param game_page is soup of an NFL DK game page
+        Returns {"Total": total}
+    """
+    total_table = game_page.find("tbody",
+                                 {"class": ["sportsbook-table__body"]})
+    t_row = total_table.find('tr')
+    tds = t_row.findAll("td", {"class": ["sportsbook-table__column-row"]})
+    total = TOTAL_REGEX.match(tds[1].text).group(1)
+    return {"Total": total}
+
+
+def _calculate_be_and_hold(odds):
+    """
+        :param text is text from DK odds section
+        Turns odds into o32, +200
+    """
+    be = []
+    over = ""
+    over_be = 0.0
+    for text in odds:
+        seperator = ""
+        if text.find('+') != -1:
+            seperator = "+"
+        else:
+            seperator = "−"
+        text = re.sub(r'O\s', 'o', text)
+        text = re.sub(r'U\s', 'u', text)
+        sections = text.split(seperator)
+        curr_be = None
+        if seperator == "+":
+            curr_be = (100.0 /
+                       (100.0 + float(re.sub(r"(u|o)", "", sections[1]))) *
+                       100)
+        else:
+            curr_be = (float(re.sub(r"(u|o)", "", sections[1])) /
+                       (100.0 + float(re.sub(r"(u|o)", "", sections[1]))) *
+                       100)
+        be.append(curr_be)
+        if text.find('o') != -1:
+            over_be = curr_be
+            over = sections[0]
+
+    hold = (be[0] + be[1]) - 100.0
+    over_be += hold
+    return over + " BE: " + "{:.1f}".format(over_be)
+
+
+def _find_players_team(team_pages, player_name):
+    """
+        :param team_pages {'url': page source from requests}
+        Takes a player name with two possible teams
+        and finds which one he is on
+    """
+    for url in team_pages:
+        for link in BeautifulSoup(team_pages.get(url),
+                                  "html.parser",
+                                  parse_only=SoupStrainer("a")):
+            if len(link.text) <= 0:
+                continue
+            if link.text.lower().find(player_name.lower()) != -1:
+                team_initial = NAME_LINK_REGEX.match(url)
+                return team_initial.group(1).upper()
+    return "TNF"
+
+
+#
+# Draft Edge Section
+#
 def get_pos_defense_ranking(class_regex):
     """
         :param class_regex is a regular expression that will match on
         what class you are looking for
         Gets ranking of teams by poistion, grabs information from draft edge
     """
-    resp = scrape(DRAFT_EDGE_URL)
+    resp = _scrape(DRAFT_EDGE_URL)
     soup = BeautifulSoup(resp.text, "html.parser")
     rows = soup.find('tbody').find_all("tr", {"class": class_regex})
     defense_rank = {}
