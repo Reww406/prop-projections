@@ -6,21 +6,21 @@ import re
 import random
 import time
 from typing import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
+from requests.adapters import HTTPAdapter, Retry
 from requests import HTTPError, ConnectTimeout, ReadTimeout
 from more_itertools import take
 import requests
 from requests_futures.sessions import FuturesSession
-from concurrent.futures import ThreadPoolExecutor
-from requests.adapters import HTTPAdapter, Retry
-from player_stats import constants as const
-from player_stats import sqllite_utils
-
 from seleniumwire import webdriver
 from bs4 import BeautifulSoup, SoupStrainer
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.desired_capabilities import DesiredCapabilities
+
+from player_stats import constants as const
+from player_stats import sqllite_utils
 
 
 # Used to generate constant
@@ -65,6 +65,7 @@ def create_draft_edge_to_int(team_urls):
     return team_name_to_int
 
 
+JAN_REGEX = re.compile(r"^\w{3}\s([1])/.*?$")
 QUES_REGEX = re.compile(r"^(.*?)(\s(Q|O|IR))?$")
 NAME_LINK_REGEX = re.compile(r"^.*?/name/(\w+)/(.*?)$", re.IGNORECASE)
 REGULAR_SESSION_REGEX = re.compile(r"^\d{4}\sRegular.*?$")
@@ -81,10 +82,10 @@ RANKING_FOR_POS_REGEX = {
 ESPN_GL_YEAR_REGEX = re.compile(r"^(.*?/id/[\d]+/).*?$")
 
 # Only matters for non current years
-GAMELOG_YEAR_URI = "type/nfl/year/" + const.LAST_YEAR
+ESPN_YEAR_URIS = [
+    "type/nfl/year/2021", "type/nfl/year/2020", "type/nfl/year/2019"
+]
 
-# https://www.espn.com/nfl/team/stats/_/name/mia/miami-dolphins
-# https://www.espn.com/nfl/team/depth/_/name/mia/miami-dolphins
 DRAFT_EDGE_URL = "https://draftedge.com/nfl-defense-vs-pos/"
 TEAM_DEF_URL = 'https://www.espn.in/nfl/stats/team/_/view/defense/teams/8'
 DK_BASE_PAGE_URL = "https://sportsbook.draftkings.com"
@@ -126,10 +127,6 @@ INT_TEAM_URL = add_team_initials([
 
 DRAFT_EDGE_TO_INT = create_draft_edge_to_int(INT_TEAM_URL)
 
-# PROPS_TO_PARSE = [
-#     "Pass Yds", "Pass Completions", "Pass Attempts", "Rush Yds", "Rec Yds",
-#     "Rush Attempts"
-# ]
 PROPS_TO_PARSE = ["Rush Yds", "Rec Yds"]
 
 DK_TO_ESPN_NAME_CONV = {
@@ -178,7 +175,7 @@ retries = Retry(total=5,
                 backoff_factor=0.1,
                 status_forcelist=[500, 502, 503, 504])
 
-session = FuturesSession(executor=ThreadPoolExecutor(max_workers=12))
+session = FuturesSession(executor=ThreadPoolExecutor(max_workers=16))
 session.mount("http://", HTTPAdapter(max_retries=retries))
 CHROM_DRIVER_PATH = "/usr/bin/chromedriver"
 CHROME_OPTIONS.add_experimental_option("prefs", PREFS)
@@ -186,12 +183,6 @@ OPTIONS = {'proxy': {'http': PROXY_URL, 'https': PROXY_URL}}
 
 CAPABILITIES = webdriver.DesiredCapabilities.CHROME
 
-DRIVER = webdriver.Chrome(CHROM_DRIVER_PATH,
-                          seleniumwire_options=OPTIONS,
-                          chrome_options=CHROME_OPTIONS,
-                          desired_capabilities=CAPABILITIES)
-
-DRIVER.set_page_load_timeout(35)
 MAX_RETRIES = 3
 
 LINE_POS_NAMES = ['LT', 'LG', 'C', 'RG', 'RT']
@@ -240,32 +231,26 @@ def _scrape_async(url):
     raise Exception("Failed to get: " + url)
 
 
-def _scrape_prop_page(url):
-    r"""
-        Get page text using Selenium
-        Waits for object on prop page before returing
-    """
-    for _ in range(3):
-        try:
-            DRIVER.get(url)
-            WebDriverWait(DRIVER, 5).until(
-                EC.presence_of_element_located(
-                    (By.CSS_SELECTOR,
-                     ".sportsbook-responsive-card-container__body")))
-            return DRIVER.page_source
-        except Exception as err:
-            print(f"Failed due to exception.. retying {err}")
-    raise Exception("Failed to get: " + url)
-
-
 def _scrape_js_page(url):
     r"""
         Get page text using Selenium
     """
-    for _ in range(3):
+    for _ in range(5):
+        print(f"attempting to get {url}")
+        DRIVER = webdriver.Chrome(CHROM_DRIVER_PATH,
+                                  seleniumwire_options=OPTIONS,
+                                  chrome_options=CHROME_OPTIONS,
+                                  desired_capabilities=CAPABILITIES)
+
+        DRIVER.set_page_load_timeout(35)
         try:
             DRIVER.get(url)
-            return DRIVER.page_source
+            if DRIVER.page_source == None:
+                print('access denied..')
+                continue
+            source = DRIVER.page_source
+            DRIVER.close()
+            return source
         except Exception as err:
             print(f"Retrying due to error: {err}")
     raise Exception("Failed to get: " + url)
@@ -303,14 +288,19 @@ def _get_player_gamelog_links(team_page, player_names):
         if match is not None:
             # Get N. Harris
             name = (match.group(1).strip())
-
-            if name not in player_names:
+            found_player = None
+            for player in player_names:
+                if player.find(name.split('-')[1]) != -1:
+                    found_player = player
+                    break
+            if found_player is None:
                 # Should skip players we didn't ask for
                 continue
-            if name not in name_link:
+            if found_player not in name_link:
                 link = match.group(0)
-                name_link[name] = (link[:link.index("_") - 1] + "/gamelog" +
-                                   link[link.index("_") - 1:])
+                name_link[found_player] = (link[:link.index("_") - 1] +
+                                           "/gamelog" +
+                                           link[link.index("_") - 1:])
     return name_link
 
 
@@ -387,6 +377,7 @@ def _filter_player_by_depth(teams):
         :returns list of filtered player_names with only starters
         Gets depth chart url using team_initial
     """
+    pos_to_pull = ['WR', 'TE', 'RB']
     players = []
     for team in teams:
         # Replaces stats wtih depth.
@@ -402,22 +393,25 @@ def _filter_player_by_depth(teams):
                     {"class": ["Table__TR", "Table__TR--sm", "Table__even"]})
             ]))
         player_table = soup.find_all("tbody", {"class": ["Table__TBODY"]})[1]
+        wr_count = 1
         for (pos, row) in zip(pos_rows, player_table.find_all('tr')):
             amount = 1
-            if pos == 'QB':
-                # Will only have prop for whoever is starting
-                amount = 2
             count = 1
-            if pos == 'FB':
-                print("skipping FB")
-                continue
-            for table_data in row.find_all('td'):
-                if count > amount:
-                    break
-                match = QUES_REGEX.match(table_data.text.strip())
-                espn_name = convert_player_name_to_espn(match.group(1))
-                players.append(espn_name)
-                count += 1
+            if pos in pos_to_pull:
+                for table_data in row.find_all('td'):
+                    if count > amount:
+                        break
+                    player_info = {}
+                    match = QUES_REGEX.match(table_data.text.strip())
+                    espn_name = convert_player_name_to_espn(match.group(1))
+                    player_info['name'] = espn_name
+                    if pos == 'WR':
+                        player_info['rank'] = f"{pos}{wr_count}"
+                        wr_count += 1
+                    else:
+                        player_info['rank'] = f"{pos}1"
+                    players.append(player_info)
+                    count += 1
     return players
 
 
@@ -482,12 +476,40 @@ def get_hurt_players(teams):
     return flags
 
 
+# TODO refactor
+def _fix_year(gamelogs):
+    index = 0
+    if gamelogs is None:
+        return None
+    for log in gamelogs:
+        if log.get(const.SEASON_2021) is not None:
+            date = log.get(const.SEASON_2021).get('Date')
+            match = JAN_REGEX.match(date)
+            if match is not None and match.group(1) == '1':
+                gamelogs[index][const.SEASON_2022] = log.get(const.SEASON_2021)
+                del gamelogs[index][const.SEASON_2021]
+        if log.get(const.SEASON_2020) is not None:
+            date = log.get(const.SEASON_2020).get('Date')
+            match = JAN_REGEX.match(date)
+            if match is not None and match.group(1) == '1':
+                gamelogs[index][const.SEASON_2021] = log.get(const.SEASON_2020)
+                del gamelogs[index][const.SEASON_2020]
+        if log.get(const.SEASON_2019) is not None:
+            date = log.get(const.SEASON_2019).get('Date')
+            match = JAN_REGEX.match(date)
+            if match is not None and match.group(1) == '1':
+                gamelogs[index][const.SEASON_2020] = log.get(const.SEASON_2019)
+                del gamelogs[index][const.SEASON_2019]
+        index += 1
+
+
 def _add_gamelogs(gl_future, gamelogs, player_name):
     """
         Gets gamelog for 'year' and adds it to 'gamelogs'
         Used in: get_player_gamelog_per_team
     """
     gamelog = _parse_player_gamelog(gl_future.result())
+    _fix_year(gamelog)
     if gamelog is not None:
         gamelogs.extend(gamelog)
     else:
@@ -518,19 +540,21 @@ def _scrape_gls_from_espn(team_initial, player_names):
     print(f"Processing team: {team_initial}")
     gl_futures_for_player = {}
     for player_name in links:
+        gl_futures_for_player[player_name] = []
         curr_year_link = links.get(player_name)
-        last_years_link = ESPN_GL_YEAR_REGEX.match(curr_year_link).group(
-            1) + GAMELOG_YEAR_URI
+        gl_futures_for_player[player_name].append(
+            _scrape_async(curr_year_link))
+        for uri in ESPN_YEAR_URIS:
+            last_years_link = ESPN_GL_YEAR_REGEX.match(curr_year_link).group(
+                1) + uri
 
-        gl_futures_for_player[player_name] = [
-            _scrape_async(curr_year_link),
-            _scrape_async(last_years_link)
-        ]
+            gl_futures_for_player[player_name].append(
+                _scrape_async(last_years_link))
 
     for player_name, gl_futures in gl_futures_for_player.items():
         gamelogs = []
-        _add_gamelogs(gl_futures[0], gamelogs, player_name)
-        _add_gamelogs(gl_futures[1], gamelogs, player_name)
+        for gl_future in gl_futures:
+            _add_gamelogs(gl_future, gamelogs, player_name)
         player_stats[player_name] = gamelogs
         print(f"Got player: {player_name}")
     return player_stats
@@ -645,11 +669,10 @@ def parse_dk_prop_pages(dk_prop_dict):
                     odds.append(t_data.text)
                 data.append(_calculate_be_and_hold(odds))
                 espn_name = convert_player_name_to_espn(player_name)
-                if espn_name in starters:
-                    # print(f"Player is a starter {player_name}")
-                    props.append(data)
-                else:
-                    print(f"{player_name}Player is not a starter..")
+                for player_info in starters:
+                    if player_info['name'].find(espn_name.split('-')[1]) != -1:
+                        data.append(player_info['rank'])
+                        props.append(data)
     return props
 
 
@@ -682,10 +705,14 @@ def _parse_team_name(prop_page):
         the team name is not on live pages..
     """
     soup = BeautifulSoup(prop_page, "html.parser")
-    teams = re.sub("AT", "@", [
+    teams = [
         div.text for div in soup.find_all(
             "div", {"class": {"event-page-countdown-timer__title"}})
-    ][0], 1).split("@")
+    ][0]
+    last_position = teams.find('AT')
+    teams = teams[:last_position] + "@" + teams[last_position + 2:]
+    teams = teams.split("@")
+    print(teams)
     return _dk_team_to_int(teams[0]) + " @ " + _dk_team_to_int(teams[1])
 
 
@@ -699,8 +726,7 @@ def _parse_dk_game_page(game_page):
         if _is_prop_link(game_link):
             if game_link['href'].find(PASSING_PROP_URI) != -1 or game_link[
                     'href'].find(RUSH_AND_REC_PROP_URI) != -1:
-                source = _scrape_prop_page(DK_BASE_PAGE_URL +
-                                           game_link['href'])
+                source = _scrape_js_page(DK_BASE_PAGE_URL + game_link['href'])
                 pages.append(source)
     return {_parse_team_name(pages[0]): pages}
 
@@ -786,7 +812,8 @@ def _find_players_team(team_pages, player_name):
                                   parse_only=SoupStrainer("a")):
             if len(link.text) <= 0:
                 continue
-            if link.text.lower().find(player_name.lower()) != -1:
+            # TODO name straight from prop need to fix so it find Gabriel Davis
+            if link.text.lower().find(player_name.split()[1].lower()) != -1:
                 team_initial = NAME_LINK_REGEX.match(url)
                 return team_initial.group(1).upper()
     return "TNF"
@@ -825,8 +852,8 @@ def get_top_n_def_for_pos(defense_stats, num, worst):
     return take(num, sorted_dict.keys())
 
 
-def driver_quit():
-    """
-        Quit Driver
-    """
-    DRIVER.quit()
+# def driver_quit():
+#     """
+#         Quit Driver
+#     """
+#     DRIVER.quit()

@@ -24,8 +24,9 @@ HURT_PLAYER_RE = re.compile(r"^(\w{2,3})\sstarting\s(\w{1,2}).*?$",
 
 # Maps function to stats function for calculating projection
 FUNC_FOR_PROP = {
-    "Rush Yds": stats.calc_rush_yds_proj,
-    "Rec Yds": stats.calc_rec_yds_proj
+    "Rush Yds": stats.get_rush_ats_prob,
+    "Rec Yds": stats.get_rec_ats_prob,
+    "Intercepts": stats.get_inter_ats_prob
 }
 
 OPP_REGEX = re.compile(r"^(@|vs)(\w+)$")
@@ -79,11 +80,14 @@ def create_fig(prop_lines, game, spread, total, date, figs, results_fn,
         'id': [],
         'prop': [],
         'odds': [],
-        'projection': [],
         'team': [],
-        'over%': []
+        '20+': [],
+        '40+': [],
+        '60+': [],
+        '80+': [],
+        'over': []
     }
-    if (fetch_new_gls):
+    if fetch_new_gls:
         print("Storing new game logs in DB")
         add_gamelogs(prop_lines, db)
     process_prop(prop_lines, game_dict, game, spread, total, team_pos, db)
@@ -165,161 +169,6 @@ def create_report(read_file, results_fn, fetch_new_gls, db):
     return 0
 
 
-# TODO game_dict needs team for this function to work...
-def create_results(game_dict, current_game, spread, total, date, result_per,
-                   db):
-    """
-        Checks how the projections went per player per prop
-    """
-    teams = current_game.split('@')
-    file_name = './results/' + spread.get(teams[0].strip(
-    ))[1:] + "-" + teams[0].strip() + "-" + teams[1].strip() + "-v3.txt"
-
-    results_file = open(file_name, 'w', encoding='UTF-8')
-    results_file.write("Game: " + str(current_game) + "\n")
-    results_file.write("Spread: " + str(spread) + "\n")
-    results_file.write("Total: " + str(total) + "\n")
-    correct = 0.0
-    total = 0.0
-    for i in range(len(game_dict.get("id"))):
-        player_name = game_dict.get('id')[i]
-        prop = game_dict.get('prop')[i]
-        most_recent_game = _get_game_stats(player_name,
-                                           game_dict.get('team')[i], date,
-                                           prop, db)
-        if most_recent_game is None:
-            continue
-        opp = OPP_REGEX.match(most_recent_game['opp']).group(2)
-        teams = [team.strip() for team in current_game.split('@')]
-        teams.remove(opp)
-        actual_stat = get_stat_from_db_row(prop, most_recent_game)
-        odds = game_dict.get('odds')[i].split()[0]
-        odds_num = float(odds[1:])
-        proj = float(game_dict.get('projection')[i])
-        hit = "Wrong"
-        if actual_stat != -1:
-            if proj > odds_num and actual_stat > odds_num:
-                hit = "Hit Over"
-            elif proj < odds_num and actual_stat > odds_num:
-                hit = "Under Projected"
-            elif proj > odds_num and actual_stat < odds_num:
-                hit = "Over Projected"
-            elif proj < odds_num and actual_stat < odds_num:
-                hit = "Hit Under"
-        if hit.find("Projected") == -1:
-            correct += 1.0
-        total += 1.0
-
-        results_file.write(player_name + ", " + teams[0] + ", " + str(prop) +
-                           ", " + str(odds) + ", P:" + str(proj) + ", A:" +
-                           str(actual_stat) + ", " + str(hit) + '\n')
-    if total > 0:
-        percentage = (float(correct / total)) * 100
-        result_per.append(percentage)
-        results_file.write("\n\n Correct: " + str(percentage) + "%")
-    results_file.close()
-
-
-def calculate_correct_per(game_dict, current_game, spread, total, date,
-                          result_per, db):
-    """
-        Checks how the projections went per player per prop
-    """
-    teams = current_game.split('@')
-
-    correct = 0.0
-    total = 0.0
-    for i in range(len(game_dict.get("id"))):
-        player_name = game_dict.get('id')[i]
-        prop = game_dict.get('prop')[i]
-        most_recent_game = _get_game_stats(player_name,
-                                           game_dict.get('team')[i], date,
-                                           prop, db)
-        if most_recent_game is None:
-            continue
-        opp = OPP_REGEX.match(most_recent_game['opp']).group(2)
-        teams = [team.strip() for team in current_game.split('@')]
-        teams.remove(opp)
-        actual_stat = get_stat_from_db_row(prop, most_recent_game)
-        odds = game_dict.get('odds')[i].split()[0]
-        proj = float(game_dict.get('projection')[i])
-        odds_num = float(odds[1:])
-        hit = "Wrong"
-        if actual_stat != -1:
-            if proj > odds_num and actual_stat > odds_num:
-                hit = "Hit Over"
-            elif proj < odds_num and actual_stat > odds_num:
-                hit = "Under Projected"
-            elif proj > odds_num and actual_stat < odds_num:
-                hit = "Over Projected"
-            elif proj < odds_num and actual_stat < odds_num:
-                hit = "Hit Under"
-        if hit.find("Projected") == -1:
-            correct += 1.0
-        total += 1.0
-
-    if total > 0:
-        percentage = (float(correct / total)) * 100
-        result_per.append(percentage)
-
-
-def calculate_error_per(game_dict, current_game, spread, total, date,
-                        result_per, db):
-    """
-        Checks how the projections went per player per prop
-    """
-    y_true = []
-    y_pred = []
-    for i in range(len(game_dict.get("id"))):
-        player_name = game_dict.get('id')[i]
-        prop = game_dict.get('prop')[i]
-        most_recent_game = _get_game_stats(player_name,
-                                           game_dict.get('team')[i], date,
-                                           prop, db)
-        if most_recent_game is None:
-            continue
-        actual_stat = get_stat_from_db_row(prop, most_recent_game)
-        proj = float(game_dict.get('projection')[i])
-        if actual_stat > 0:
-            y_true.append(actual_stat)
-            y_pred.append(proj)
-    result_per.append(
-        metrics.mean_absolute_percentage_error(y_true=y_true, y_pred=y_pred))
-
-
-def _get_game_stats(player_name, team_initial, game_date, prop, db):
-    """
-        Gets the most recent gamelog for player
-    """
-    player_name = scraper.convert_player_name_to_espn(player_name)
-    return sqllite_utils.get_game_stats(player_name, team_initial, game_date,
-                                        get_stat_db(prop), db)
-
-
-# TODO Get from database row.. same as dict
-def get_stat_from_db_row(prop, row):
-    """
-        Gets actual stat from most recent game
-    """
-    if row is None:
-        return '-1'
-    if prop.lower() == 'rush attempts':
-        return float(row['att'])
-    if prop.lower() == 'receptions':
-        return float(row['rec'])
-    if prop.lower() == 'rec yds':
-        return float(row['yds'])
-    if prop.lower() == 'rush yds':
-        return float(row['yds'])
-    if prop.lower() == 'pass attempts':
-        return float(row['att'])
-    if prop.lower() == 'pass completions':
-        return float(row['cmp'])
-    if prop.lower() == 'pass yds':
-        return float(row['yds'])
-    return 0.0
-
-
 def get_stat_db(prop):
     """
         Gets actual stat from most recent game
@@ -338,6 +187,18 @@ def build_graphic(data_f, game):
         Takes Pandas data frame and builds a table from it
     """
 
+    game_dict = {
+        'id': [],
+        'prop': [],
+        'odds': [],
+        'team': [],
+        '20+': [],
+        '40+': [],
+        '60+': [],
+        '80+': [],
+        'over': []
+    }
+
     df_dict = data_f.to_dict(orient='records')
     rows = len(data_f.axes[0])
     cols = len(data_f.axes[1])
@@ -348,23 +209,29 @@ def build_graphic(data_f, game):
     for row in range(rows):
         d = df_dict[row]
         # Add data to graph
-        ax.text(x=.3, y=row, s=d['id'], va='center', ha='left')
-        ax.text(x=1.9, y=row, s=d['team'], va='center', ha='left')
-        ax.text(x=2.6, y=row, s=d['prop'], va='center', ha='left')
-        ax.text(x=3.5, y=row, s=d['odds'], va='center', ha='left')
-        ax.text(x=4.8, y=row, s=d['over%'], va='center', ha='left')
-        ax.text(x=6.4, y=row, s=d['projection'], va='center', ha='right')
+        ax.text(x=-1, y=row, s=d['id'], va='center', ha='left')
+        ax.text(x=1.2, y=row, s=d['prop'], va='center', ha='left')
+        ax.text(x=2.5, y=row, s=d['odds'], va='center', ha='left')
+        ax.text(x=4.4, y=row, s=d['team'], va='center', ha='left')
+        ax.text(x=5.5, y=row, s=d['20+'], va='center', ha='left')
+        ax.text(x=6.5, y=row, s=d['40+'], va='center', ha='left')
+        ax.text(x=7.5, y=row, s=d['60+'], va='center', ha='left')
+        ax.text(x=8.5, y=row, s=d['80+'], va='center', ha='left')
+        ax.text(x=9.5, y=row, s=d['over'], va='center', ha='left')
 
     # Column Title
-    ax.text(.3, rows, 'Player', weight='bold', ha='left')
-    ax.text(2.1, rows, 'Team', weight='bold', ha='center')
-    ax.text(2.6, rows, 'Prop', weight='bold', ha='left')
-    ax.text(3.5, rows, 'Odds', weight='bold', ha='left')
-    ax.text(5.0, rows, 'Over%', weight='bold', ha='center')
-    ax.text(6.4, rows, 'Projection', weight='bold', ha='right')
+    ax.text(-1, rows, 'Player', weight='bold', ha='left')
+    ax.text(1.2, rows, 'Prop', weight='bold', ha='left')
+    ax.text(2.5, rows, 'Odds', weight='bold', ha='left')
+    ax.text(4.4, rows, 'Team', weight='bold', ha='left')
+    ax.text(5.5, rows, '20+', weight='bold', ha='left')
+    ax.text(6.5, rows, '40+', weight='bold', ha='left')
+    ax.text(7.5, rows, '60+', weight='bold', ha='left')
+    ax.text(8.5, rows, '80+', weight='bold', ha='left')
+    ax.text(9.4, rows, 'Over %', weight='bold', ha='left')
     # Creates lines
     for row in range(rows):
-        ax.plot([0, cols + .7], [row - .5, row - .5],
+        ax.plot([-0.2, cols + .7], [row - 1.5, row - 1.5],
                 ls=':',
                 lw='.5',
                 c='grey')
@@ -377,28 +244,19 @@ def build_graphic(data_f, game):
     #     alpha=.2,
     #     zorder=-1)
     # line under title
-    ax.plot([0, cols + 0.7], [row + 0.6, row + 0.6], lw='.5', c='black')
+    ax.plot([-.5, cols + 0.7], [row + 0.6, row + 0.6], lw='.5', c='black')
 
     ax.axis('off')
     ax.set_title(game, loc='left', fontsize=18, weight='bold')
     return fig
 
 
-def adjust_name_for_chart(name):
+def _adjust_name_for_chart(name):
     split = name.split("-")
-    new_name = split[0].capitalize() + " " + split[1].capitalize()
+    new_name = split[0].capitalize()[0:1] + ". " + split[1].capitalize()
     return new_name
 
 
-#  Jerick McKinnon, KC, Rec Yds, o13.5 −120,
-def _get_stat_and_section(prop):
-    if prop.strip() == 'Rec Yds':
-        return [const.RECEIVING_KEY, 'yds']
-    elif prop.strip() == 'Rush Yds':
-        return [const.RUSHING_KEY, 'yds']
-
-
-# TODO fix for SQL
 def process_prop(lines, table, game, spread, total, team_pos, db):
     r"""
       Processes a prop line from prop list gets opponent and
@@ -407,33 +265,31 @@ def process_prop(lines, table, game, spread, total, team_pos, db):
     for line in lines:
         fields = [field.strip() for field in line.split(',')]
         prop, team, odds = fields[2], fields[1], fields[3]
+        if 4 < len(fields):
+            pos_rank = fields[4]
+
         player_name = scraper.convert_player_name_to_espn(
             line.split(",")[0].strip())
         opp = [x.strip() for x in game.split("@")]
-        # TODO FAILING ON TNF
         opp.remove(team)
         opp = opp[0]
-        # print(f"Calculating proj for: {player_name}")
-        if prop in FUNC_FOR_PROP:
 
-            proj = FUNC_FOR_PROP.get(prop)(player_name, opp, team, spread,
-                                           total, team_pos, db)
-            if proj is not None:
-                table.get('id').append(adjust_name_for_chart(player_name))
-                table.get('prop').append(prop)
-                table.get('projection').append(proj)
-                table.get('odds').append(odds)
-                table.get('team').append(team)
-                odds_num = float(odds.split()[0][1:])
-                sec_and_stat = _get_stat_and_section(prop)
-                table.get('over%').append(
-                    stats.calculate_ats(player_name, team, sec_and_stat[0],
-                                        sec_and_stat[1], odds_num, db))
-            else:
-                # print("Couldn't get projection..")
-                pass
-        else:
-            print(f"No func for prop: {prop}")
+        if prop in FUNC_FOR_PROP:
+            probs = FUNC_FOR_PROP.get(prop)(player_name, opp, team, spread,
+                                            total, float(odds.split()[0][1:]),
+                                            pos_rank, db)
+            if probs == None:
+                continue
+
+            table.get('id').append(_adjust_name_for_chart(player_name))
+            table.get('prop').append(prop)
+            table.get('odds').append(odds)
+            table.get('team').append(team)
+            table.get('20+').append(probs.get('20+'))
+            table.get('40+').append(probs.get('40+'))
+            table.get('60+').append(probs.get('60+'))
+            table.get('80+').append(probs.get('80+'))
+            table.get('over').append(probs.get('over'))
 
 
 def _create_prop_str(prop):
@@ -479,33 +335,34 @@ def write_props(props, file):
 
 
 # try:
-# results_per = []
+conn = sqllite_utils.get_conn()
+results_per = []
 # for row in sqllite_utils.get_player_stats_sec("jalen-hurts", 'PHI',
 #                                               'Passing'):
 #     print(f"{row} \n")
 # PROP_FILE_TS = "./props/" + START_TIME + "-props.txt"
 # prop_file = open(PROP_FILE_TS, 'w', encoding='UTF-8')
-# create_prop_file(prop_file, 0, "Thu 11/24")
+# create_prop_file(prop_file, 0, "Sun 12/4")
 # prop_file.close()
 
-# prop_file = open(PROP_FILE_TS, 'r', encoding='UTF-8')
-# create_report(prop_file, None, False)
+prop_file = open("./props/" + "1670034167-props.txt", 'r', encoding='UTF-8')
+create_report(prop_file, None, False, conn)
+prop_file.close()
+
+# prop_file = open("test_props/combined-1.txt", 'r', encoding='UTF-8')
+# results_per.append(create_report(prop_file, None, True, conn))
 # prop_file.close()
 
-# prop_file = open("props/first-week-v2.txt", 'r', encoding='UTF-8')
-# results_per.append(create_report(prop_file, calculate_error_per, False))
+# prop_file = open("test_props/combined-2.txt", 'r', encoding='UTF-8')
+# results_per.append(create_report(prop_file, None, True, conn))
 # prop_file.close()
 
-# prop_file = open("props/second-week-v2.txt", 'r', encoding='UTF-8')
-# results_per.append(create_report(prop_file, calculate_error_per, False))
+# prop_file = open("test_props/combined-3.txt", 'r', encoding='UTF-8')
+# results_per.append(create_report(prop_file, None, True, conn))
 # prop_file.close()
 
-# prop_file = open("props/third-week-v2.txt", 'r', encoding='UTF-8')
-# results_per.append(create_report(prop_file, calculate_error_per, False))
-# prop_file.close()
-
-# prop_file = open("props/fourth-week-v2.txt", 'r', encoding='UTF-8')
-# results_per.append(create_report(prop_file, calculate_error_per, False))
+# prop_file = open("test_props/combined-4.txt", 'r', encoding='UTF-8')
+# results_per.append(create_report(prop_file, None, True, conn))
 # prop_file.close()
 
 # print(results_per)
@@ -514,6 +371,6 @@ def write_props(props, file):
 # else:
 #     print(f"Total correct: {results_per}")
 
-# finally:
-# scraper.driver_quit()
+# # finally:
+
 #     prop_file.close()

@@ -1,374 +1,213 @@
 # from player_stats import stats
 from concurrent.futures import ThreadPoolExecutor
 import copy
+import json
+import pickle
+import re
 import time
+import joblib
+from sklearn import svm
+
+from sklearn.model_selection import RandomizedSearchCV, train_test_split
+from sklearn.pipeline import Pipeline, make_pipeline
+from sklearn.preprocessing import MinMaxScaler, RobustScaler, StandardScaler, scale
+from sklearn.utils import column_or_1d
 from player_stats import scraper
 import numpy as np
+import pandas as pd
 
-from random import randint
+from scipy.stats import uniform
 from player_stats import constants as const
 from player_stats import sqllite_utils
+from player_stats import stats
+from sklearn.neural_network import MLPRegressor
 import main
 
-running_backs = {
-    'CIN': 'J. Mixon',
-    'BUF': 'D. Singletary',
-    'CHI': 'D. Montgomery',
-    'TEN': 'D. Henry',
-    'TB': 'L. Fournette',
-    'CAR': 'D. Foreman',
-    'LV': 'J. Jacobs',
-    'CLE': 'N. Chubb'
-}
+# Regular prediction, top_wr_d, worst_wr_d, top_qb_d, worst_qb_d, team_spread, total, line_hurt, wr_hurt
+# def build_df(db):
+#     game_dict = {
+#         "proj": [],
+#         "wr_d_rank": [],
+#         # "worst_wr_d": [],
+#         "qb_d_rank": [],
+#         # "worst_qb_d": [],
+#         "team_spread": [],
+#         "total": [],
+#         # "line_hurt": [],
+#         # "wr_hurt": [],
+#         "actual_stat": []
+#     }
 
-quaterbacks = {
-    'KC': 'P. Mahomes',
-    'PHI': 'J. Hurts',
-    'CLE': 'J. Brissett',
-    'ATL': 'M. Mariota',
-    'BUF': 'J. Allen',
-    'SEA': 'G. Smith',
-    'JAX': 'T. Lawrence',
-    'TEN': 'R. Tannehill'
-}
-
-recievers = {
-    'BUF': 'S. Diggs',
-    'SF': 'B. Aiyuk',
-    'TEN': 'R. Woods',
-    'PIT': 'D. Johnson',
-    'NO': 'C. Olave',
-    'LAR': 'C. Kupp',
-    'CLE': 'A. Cooper',
-    'LAC': 'M. Williams'
-}
-
-# Use percentiles or MAD which is a more robust approximatin
-# TODO try IQR on with more stats..
-# def remove_outliers(stat_key, sec_key, gamelogs):
-#     r"""
-#         :param stat_key = YDS, ATT, CMP, REC
-#         :param sec_key = Passing, Rushing or Recieving
-#         :param gamelogs = the players game logs
-#         Removes values X signma away from the mean.
-#         year: [stats]
-#     """
-#     stat_section = get_stats(gamelogs, sec_key)
-#     values = remove_non_starts(stat_key, sec_key, stat_section)
-#     values = np.array(values)
-#     values.sort()
-#     if len(values) <= 1:
-#         # Can't get mean if it's one stat...
-#         return stat_section
-#     mean = np.mean(values)
-#     std = np.std(values)
-#     new_stat_sec = {}
-#     for year, year_stats in stat_section.items():
-#         if year_stats is None:
-#             continue
-#         outliers_removed = []
-#         for game_log in year_stats:
-#             stat = float(game_log.get(stat_key))
-#             z = (stat - mean) / std
-#             if z < -2.0 or z > 2.0:
-#                 print(f"Removing outlier: {stat}")
+#     for i in range(1, 5):
+#         f = open(f"test_props/combined-{i}.txt", 'r', encoding='UTF-8')
+#         current_prop_lines, current_game, current_spread, current_total = [], "", None, 0
+#         team_pos = {}
+#         for line in f:
+#             game_match = main.GAME_REGEX.match(line)
+#             total_match = main.TOTAL_REGEX.match(line)
+#             spread_match = main.SPREAD_REGEX.match(line)
+#             date_match = main.DATE_REGEX.match(line)
+#             hurt_pos = main.HURT_PLAYER_RE.match(line)
+#             if len(line.strip()) == 0:
+#                 continue
+#             if bool(hurt_pos):
+#                 if team_pos.get(hurt_pos.group(1)) is None:
+#                     team_pos[hurt_pos.group(1)] = [hurt_pos.group(2)]
+#                 else:
+#                     team_pos[hurt_pos.group(1)].append(hurt_pos.group(2))
+#                 continue
+#             if bool(date_match):
+#                 game_date = date_match.group(1)
+#                 continue
+#             if bool(total_match):
+#                 current_total = float(total_match.group(1).strip())
+#                 continue
+#             if bool(spread_match):
+#                 current_spread = json.loads(
+#                     spread_match.group(1).replace("'", '"').strip())
+#                 continue
+#             if bool(game_match):
+#                 # print(f"Found game: {game_match.group(0)}")
+#                 if len(current_game) > 0 and current_game != game_match.group(
+#                         0):
+#                     # Not the first game found..
+#                     process_prop(current_prop_lines, game_dict, current_game,
+#                                  current_spread, current_total, team_pos,
+#                                  game_date, db)
+#                     current_prop_lines = []
+#                     team_pos = {}
+#                     current_game = game_match.group(0).strip()
+#                 elif current_game != game_match.group(0):
+#                     # First game in file
+#                     current_game = game_match.group(0)
 #             else:
-#                 outliers_removed.append(game_log)
-#         new_stat_sec[year] = outliers_removed
-#     return new_stat_sec
+#                 # if nothing else then prop line..
+#                 if line.split(",")[1].strip() == 'TNF':
+#                     # print("Skipping TNF")
+#                     continue
+#                 current_prop_lines.append(line)
+#     for key, value in game_dict.items():
+#         print(f"{key} : {len(value)}")
+#     return pd.DataFrame(game_dict)
+
+OPP_REGEX = re.compile(r"^(@|vs)(\w+)$")
 
 
-def rand(weight):
-    diff = 10
-    return randint(weight - diff, weight + diff)
+def get_all_games(table, db):
+    r"""
+      Processes a prop line from prop list gets opponent and
+      projection
+    """
+
+    all_gls = sqllite_utils.get_all_game_logs(const.RECEIVING_KEY, db)
+    print(len(all_gls))
+    for gl in all_gls:
+        opp = OPP_REGEX.match(gl['opp']).group(2)
+        player_game_logs = sqllite_utils.get_player_stats_sec(
+            gl.get('player_name'), gl.get("team_int"), const.RECEIVING_KEY, db)
+
+        if len(player_game_logs) <= 0:
+            # print(f"Couldn't get game logs for:{player_name}")
+            continue
+        odds = sqllite_utils.get_odds_for_game(gl.get('season_year'),
+                                               gl.get('game_date'),
+                                               gl.get('team_int'), db)
+        if odds is None:
+            continue
+
+        yds_proj = stats.get_weighted_mean(
+            'yds',
+            stats.remove_outliers('yds', const.RECEIVING_KEY,
+                                  player_game_logs))
+        tgts_proj = stats.get_weighted_mean(
+            'tgts',
+            stats.remove_outliers('tgts', const.RECEIVING_KEY,
+                                  player_game_logs))
+
+        table.get('proj').append(yds_proj)
+
+        # if opp in stats.TOP_WR_D:
+        table.get('wr_d_rank').append(stats.TOP_WR_D.index(opp) + 1)
+
+        table.get('qb_d_rank').append(stats.TOP_QB_D.index(opp) + 1)
+        table.get('team_spread').append(odds.get('spread'))
+        table.get('total').append(odds.get('total'))
+
+        table.get('actual_stat').append(gl.get('yds'))
 
 
-def rand_with_diff(weight, diff):
-    return randint(weight - diff, weight + diff)
+conn = sqllite_utils.get_db_in_mem()
+game_dict = {
+    "proj": [],
+    "wr_d_rank": [],
+    # "worst_wr_d": [],
+    "qb_d_rank": [],
+    # "worst_qb_d": [],
+    "team_spread": [],
+    "total": [],
+    # "line_hurt": [],
+    # "wr_hurt": [],
+    "actual_stat": []
+}
+get_all_games(game_dict, conn)
+print(len(game_dict['proj']))
+# for i in range(0, 100):
+#     print(
+#         f"P: {game_dict.get('proj')[i]} D: {game_dict.get('qb_d_rank')[i]} Spread: {game_dict.get('team_spread')[i]} Total {game_dict.get('total')[i]} AS {game_dict.get('actual_stat')[i]}"
+#     )
+df = pd.DataFrame(game_dict)
+target_col = ['actual_stat']
+predictors = list(set(list(df.columns)) - set(target_col))
 
+X = df[predictors].values
+y = column_or_1d(df[target_col].values)
 
-def pos_rand(weight):
-    diff = 20
-    return randint(weight, weight + diff)
+x_train, x_test, y_train, y_test = train_test_split(X,
+                                                    y,
+                                                    test_size=0.25,
+                                                    random_state=42)
+print(x_train.shape)
+print(x_test.shape)
 
+scaler = StandardScaler()
 
-def randomize_weights():
-    # 21
-    const.LAST_Y_STAT_W = 55
-    const.BLOW_OUT_STAT_W = 52
-    const.THIS_YEAR_STAT_W = 149
-    const.TOP_RB_D_YDS_WEIGHT = rand(-30)
-    const.WORST_RB_D_YDS_WEIGHT = pos_rand(0)
-    const.WORST_QB_D_REC_YDS_WEIGHT = pos_rand(0)
-    const.WORST_WR_D_YDS_WEIGHT = pos_rand(0)
-    const.TOP_QB_D_REC_YDS_WEIGHT = rand(-30)
-    const.TOP_WR_D_YDS_WEIGHT = rand(-18)
-    # [very underdog, very fav, slight underdog, slight fav, close game]
-    const.RUSH_YDS_AT_S_W = [rand(0), rand(0), rand(0), rand(0), rand(0)]
-    const.REC_YDS_HT_S_W = [
-        rand(0), rand(0), rand(0),
-        rand(0), rand(0), rand(0)
-    ]
-    const.REC_YDS_LT_S_W = [rand(0), rand(0), rand(0), rand(0), rand(0)]
-    const.STARTING_WR_HURT_WEIGHT = rand(-10)
-    const.LINE_HURT_WEIGHT_REC = rand(-10)
-    const.LINE_HURT_WEIGHT_RUSH = rand(-30)
+mlp = MLPRegressor(random_state=42,
+                   hidden_layer_sizes=(10, ),
+                   solver='adam',
+                   max_iter=3000,
+                   learning_rate_init=0.0001,
+                   activation='relu')
 
+distributions = {
+    "mlp__activation": ['relu'],
+    "mlp__solver": ['lbfgs', 'adam', 'spg'],
+    "mlp__max_iter": [500, 1000, 2000, 5000, 10000],
+    "mlp__learning_rate_init":
+    [0.001, 0.01, 0.05, 0.002, 0.025, 0.1, 0.050, 0.0001],
+    "mlp__hidden_layer_sizes": [(i, ) for i in range(0, 100, 5)]
+}
 
-best_top_qb_d_rec_yds_weight = 0
-best_worst_qb_d_rec_yds_weight = 0
-best_top_rb_d_yds_weights = 0
-best_worst_rb_d_yds_weights = 0
-best_top_wr_d_yds_weights = 0
-best_worst_wr_d_yds_weight = 0
-best_line_hurt_weight_rush = 0
-best_line_hurt_weight_rec = 0
-best_starting_wr_hurt_weight = 0
-best_last_y_stat_w = 0
-best_this_year_stat_w = 0
-best_blow_out_stat_w = 0
-best_rush_yds_at_s_w = [0, 0, 0, 0, 0]
-best_rec_yds_ht_s_w = [0, 0, 0, 0, 0]
-best_rec_yds_lt_s_w = [0, 0, 0, 0, 0]
+pipe = Pipeline([('scaler', MinMaxScaler()), ('mlp', mlp)])
+pipe.fit(x_train, y_train)
+# print(x_train[0])
+# scaler.fit(x_train)
+# x_train = scaler.transform(x_train)
+# x_test = scaler.transform(x_test)
 
-# con = sqllite_utils.get_db_in_mem()
+clf = RandomizedSearchCV(pipe, distributions, random_state=1)
+# mlp.fit(x_train, y_train)
+# search = clf.fit(x_train, y_train)
+# print(search.best_params_)
 
+print(len(x_test))
+print(pipe.score(x_test, y_test))
+print(pipe.predict(
+    np.array([
+        88.51076561,
+        23,
+        20,
+        -14.5,
+        40,
+    ]).reshape(1, -1)))
 
-def _process_prop_file(prop_array, con):
-
-    results = main.create_report(prop_array, main.calculate_error_per, False,
-                                 con)
-    return results
-
-
-def load_prop_file_into_memory(file_name):
-    prop_file = open(file_name, 'r', encoding='UTF-8')
-    lines = []
-    for line in prop_file:
-        lines.append(line)
-    prop_file.close()
-    return lines
-
-
-#
-# Single weight
-#
-try:
-    print_points = [i * 1000 for i in range(0, 100)]
-    lowest_error = 100
-    conn = sqllite_utils.get_db_in_mem()
-    start_time = epoch_time = int(time.time())
-    files = []
-    connections = []
-    # for i in range(0, 4):
-    #     connections.append(sqllite_utils.get_db_in_mem())
-    for i in range(1, 5):
-        files.append(
-            load_prop_file_into_memory(f"test_props/combined-{i}.txt"))
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        for i in np.arange(0, 100000, 1):
-            randomize_weights()
-            results_per = []
-            futures = []
-            # print(const.THIS_YEAR_STAT_W)
-            for file_num in range(0, 4):
-                # futures.append(
-                #     executor.submit(_process_prop_file, files[file_num],
-                #                     connections[file_num]))
-                results_per.append(_process_prop_file(files[file_num], conn))
-            # for future in futures:
-            #     results_per.append(future.result())
-
-            total_error_per = float("%.3f" % np.mean(results_per))
-            if i in print_points:
-                print(f"Took: {(int(time.time()) - start_time)/60}")
-                print(f"At: {i}")
-            # print(f"{total_error_per}")
-            if total_error_per <= lowest_error:
-                print(f"new lowest error: {total_error_per}")
-                lowest_error = total_error_per
-                best_top_qb_d_rec_yds_weight = const.TOP_QB_D_REC_YDS_WEIGHT
-                best_worst_qb_d_rec_yds_weight = const.WORST_QB_D_REC_YDS_WEIGHT
-                best_top_rb_d_yds_weights = const.TOP_RB_D_YDS_WEIGHT
-                best_worst_rb_d_yds_weights = const.WORST_RB_D_YDS_WEIGHT
-                best_top_wr_d_yds_weights = const.TOP_WR_D_YDS_WEIGHT
-                best_worst_wr_d_yds_weight = const.WORST_WR_D_YDS_WEIGHT
-                best_line_hurt_weight_rush = const.LINE_HURT_WEIGHT_RUSH
-                best_line_hurt_weight_rec = const.LINE_HURT_WEIGHT_REC
-                best_starting_wr_hurt_weight = const.STARTING_WR_HURT_WEIGHT
-                best_last_y_stat_w = const.LAST_Y_STAT_W
-                best_this_year_stat_w = const.THIS_YEAR_STAT_W
-                best_blow_out_stat_w = const.BLOW_OUT_STAT_W
-                best_rush_yds_at_s_w = const.RUSH_YDS_AT_S_W
-                best_rec_yds_ht_s_w = const.REC_YDS_HT_S_W
-                best_rec_yds_lt_s_w = const.REC_YDS_LT_S_W
-                # print(f"""best Top QB D REC YDS: {best_top_qb_d_rec_yds_weight}
-                #         Worst QB D REC YDS {best_worst_qb_d_rec_yds_weight}
-                #         Top rb d yds {best_top_rb_d_yds_weights}
-                #         Worst rb d yds {best_worst_rb_d_yds_weights}
-                #         top wr d {best_top_wr_d_yds_weights}
-                #         worst wr d {best_worst_wr_d_yds_weight}
-                #         line hurt rush {best_line_hurt_weight_rush}
-                #         line hurt rec {best_line_hurt_weight_rec}
-                #         starting wr out {best_starting_wr_hurt_weight}
-                #         last y weight {best_last_y_stat_w}
-                #         this y weight {best_this_year_stat_w}
-                #         blowout weight {best_blow_out_stat_w}
-                #         rush yds spread {best_rush_yds_at_s_w}
-                #         lt rec yards {best_rec_yds_lt_s_w}
-                #         ht rec yards {best_rec_yds_ht_s_w}""")
-finally:
-    print(f"""best Top QB D REC YDS: {best_top_qb_d_rec_yds_weight}
-            Worst QB D REC YDS {best_worst_qb_d_rec_yds_weight}
-            Top rb d yds {best_top_rb_d_yds_weights}
-            Worst rb d yds {best_worst_rb_d_yds_weights}
-            top wr d {best_top_wr_d_yds_weights}
-            worst wr d {best_worst_wr_d_yds_weight}
-            line hurt rush {best_line_hurt_weight_rush}
-            line hurt rec {best_line_hurt_weight_rec}
-            starting wr out {best_starting_wr_hurt_weight}
-            last y weight {best_last_y_stat_w}
-            this y weight {best_this_year_stat_w}
-            blowout weight {best_blow_out_stat_w}
-            rush yds spread {best_rush_yds_at_s_w}
-            lt rec yards {best_rec_yds_lt_s_w}
-            ht rec yards {best_rec_yds_ht_s_w}""")
-# for file_num in range(1, 5):
-#     prop_file = open(f"test_props/rec-yds-{file_num}.txt",
-#                      'r',
-#                      encoding='UTF-8')
-#     results_per.append(
-#         main.create_report(prop_file, main.calculate_error_per, False))
-#     prop_file.close()
-# total_error_per = np.mean(results_per)
-
-# print(f"Best weight {best_weight} new score {total_error_per}")
-
-#
-# Spread Weight
-#
-# best_weights = [0, 0, 0, 0, 0]
-# top_score = prev_score
-# best_weight = 0
-# for x in np.arange(0, 5):
-#     top_score = prev_score
-#     best_weight = 0
-#     print("next weight")
-#     for i in np.arange(40, -40, -0.25):
-#         results_per = []
-#         const.REC_YDS_LT_S_W[x] = i
-#         # print(const.RUSH_YDS_AT_S_W)
-#         for file_num in range(1, 5):
-#             prop_file = open(f"test_props/rec-yds-{file_num}.txt",
-#                              'r',
-#                              encoding='UTF-8')
-#             results_per.append(
-#                 main.create_report(prop_file, main.calculate_correct_per,
-#                                    False))
-#             prop_file.close()
-#         total_cor = np.mean(results_per)
-#         if total_cor >= top_score:
-#             if total_cor == top_score:
-#                 if abs(i) < abs(best_weight):
-#                     top_score = total_cor
-#                     best_weight = i
-#                     print(f"new top score {top_score} weights: {best_weight}")
-#             else:
-#                 top_score = total_cor
-#                 best_weight = i
-#                 print(f"new top score {top_score} weights: {best_weight}")
-#         const.REC_YDS_LT_S_W[x] = 0
-#         best_weights[x] = best_weight
-
-# results_per = []
-# for file_num in range(1, 5):
-#     prop_file = open(f"test_props/rec-yds-{file_num}.txt",
-#                      'r',
-#                      encoding='UTF-8')
-#     results_per.append(
-#         main.create_report(prop_file, main.calculate_correct_per, False))
-#     prop_file.close()
-# prev_score = np.mean(results_per)
-# print(f"Total score no change: {prev_score}")
-
-# #
-# # Spread Weight
-# #
-# # best_weights = [0, 0, 0, 0, 0]
-# # top_score = prev_score
-# # best_weight = 0
-# # for x in np.arange(0, 5):
-# #     top_score = prev_score
-# #     best_weight = 0
-# #     print("next weight")
-# #     for i in np.arange(40, -40, -0.25):
-# #         results_per = []
-# #         const.REC_YDS_LT_S_W[x] = i
-# #         # print(const.RUSH_YDS_AT_S_W)
-# #         for file_num in range(1, 5):
-# #             prop_file = open(f"test_props/rec-yds-{file_num}.txt",
-# #                              'r',
-# #                              encoding='UTF-8')
-# #             results_per.append(
-# #                 main.create_report(prop_file, main.calculate_correct_per,
-# #                                    False))
-# #             prop_file.close()
-# #         total_cor = np.mean(results_per)
-# #         if total_cor >= top_score:
-# #             if total_cor == top_score:
-# #                 if abs(i) < abs(best_weight):
-# #                     top_score = total_cor
-# #                     best_weight = i
-# #                     print(f"new top score {top_score} weights: {best_weight}")
-# #             else:
-# #                 top_score = total_cor
-# #                 best_weight = i
-# #                 print(f"new top score {top_score} weights: {best_weight}")
-# #         const.REC_YDS_LT_S_W[x] = 0
-# #         best_weights[x] = best_weight
-
-# #
-# # Single weight
-# #
-# best_weight = 0
-# top_score = prev_score
-# print(prev_score)
-# for i in np.arange(-35, 35, 0.25):
-#     results_per = []
-#     const.LINE_HURT_WEIGHT_RUSH = i
-#     # print(const.THIS_YEAR_STAT_W)
-#     for file_num in range(1, 5):
-#         prop_file = open(f"test_props/rec-yds-{file_num}.txt",
-#                          'r',
-#                          encoding='UTF-8')
-#         results_per.append(
-#             main.create_report(prop_file, main.calculate_correct_per, False))
-#         prop_file.close()
-#     total_cor = np.mean(results_per)
-#     # print(f"{total_cor} : {const.LINE_HURT_WEIGHT_REC}")
-#     if total_cor >= top_score:
-#         if total_cor == top_score:
-#             if abs(i) < abs(best_weight):
-#                 top_score = total_cor
-#                 best_weight = i
-#                 print(f"new top score {top_score} weights: {best_weight}")
-#         else:
-#             top_score = total_cor
-#             best_weight = i
-#             print(f"new top score {top_score} weights: {best_weight}")
-
-# results_per = []
-# const.LINE_HURT_WEIGHT_RUSH = best_weight
-# for file_num in range(1, 5):
-#     prop_file = open(f"test_props/rec-yds-{file_num}.txt",
-#                      'r',
-#                      encoding='UTF-8')
-#     results_per.append(
-#         main.create_report(prop_file, main.calculate_correct_per, False))
-#     prop_file.close()
-# prev_score = np.mean(results_per)
-# # print(f"Results per: {results_per}")
-# total_cor = np.mean(results_per)
-# prop_file.close()
-
-# print(f"Best weight {best_weight} new score {total_cor}")
+# # joblib.dump(pipe, 'rec-pipeline.pkl')
